@@ -180,8 +180,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         spec_info: Optional[SpecInfo],
     ):
         """Initialize metadata for CUDA graph capture."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+        if not (forward_mode.is_decode_or_idle() and spec_info is None) and not forward_mode.is_target_verify() and not forward_mode.is_draft_extend():
+            # Delegate to parent for non-decode modes or when speculative execution is used.
             return super().init_forward_metadata_capture_cuda_graph(
                 bs,
                 num_tokens,
@@ -225,7 +225,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     ):
         """Replay CUDA graph with new inputs."""
         # Delegate to parent for non-decode modes or when speculative execution is used.
-        if not (forward_mode.is_decode_or_idle() and spec_info is None):
+        if not (forward_mode.is_decode_or_idle() and spec_info is None) and not forward_mode.is_target_verify() and not forward_mode.is_draft_extend():
             return super().init_forward_metadata_replay_cuda_graph(
                 bs,
                 req_pool_indices,
@@ -258,11 +258,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
-        # Delegate to parent for non-decode modes or when speculative execution is used.
+        # We impl mtp decode for now
         if not (
             forward_batch.forward_mode.is_decode_or_idle()
             and forward_batch.spec_info is None
-        ):
+        ) and not forward_batch.forward_mode.is_target_verify() and not forward_batch.forward_mode.is_draft_extend():
             return super().init_forward_metadata(forward_batch)
 
         bs = forward_batch.batch_size
@@ -324,6 +324,93 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
         if query.dim() == 3:
             query = query.unsqueeze(1)
+
+        # Prepare KV cache inline
+        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        pages = k_cache.view(-1, self.page_size, self.kv_cache_dim)
+        # TRT-LLM expects single KV data with extra dimension
+        kv_cache = pages.unsqueeze(1)
+
+        # Get metadata
+        metadata = (
+            getattr(forward_batch, "decode_trtllm_mla_metadata", None)
+            or self.forward_metadata
+        )
+
+        # Scale computation for TRTLLM MLA kernel:
+        # - BMM1 scale = q_scale * k_scale * softmax_scale
+        # - For FP16 path we keep q_scale = 1.0, softmax_scale = 1/sqrt(head_dim) which is pre-computed as layer.scaling
+        # - k_scale is read from model checkpoint if available
+        # TODO: Change once fp8 path is supported
+        q_scale = 1.0
+        k_scale = (
+            layer.k_scale_float
+            if getattr(layer, "k_scale_float", None) is not None
+            else 1.0
+        )
+
+        bmm1_scale = q_scale * k_scale * layer.scaling
+
+        # Call TRT-LLM kernel
+        raw_out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=metadata.workspace,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            block_tables=metadata.block_kv_indices,
+            seq_lens=forward_batch.seq_lens.to(torch.int32),
+            max_seq_len=int(metadata.block_kv_indices.shape[1] * self.page_size),
+            bmm1_scale=bmm1_scale,
+        )
+
+        # Extract value projection part and reshape
+        raw_out_v = raw_out[..., : layer.v_head_dim].contiguous()
+        output = raw_out_v.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+
+        return output
+
+    def forward_extend(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache: bool = True,
+        q_rope: Optional[torch.Tensor] = None,
+        k_rope: Optional[torch.Tensor] = None,
+    ):
+        if not forward_batch.forward_mode.is_target_verify() and not forward_batch.forward_mode.is_draft_extend():
+            return super().forward_extend(
+                q, k, v, layer, forward_batch, save_kv_cache, q_rope, k_rope
+            )
+
+        if k is not None and save_kv_cache:
+            cache_loc = forward_batch.out_cache_loc
+            if k_rope is not None:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, cache_loc, k, k_rope
+                )
+            elif v is not None:
+                forward_batch.token_to_kv_pool.set_kv_buffer(layer, cache_loc, k, v)
+        
+        # Prepare query tensor inline
+        if q_rope is not None:
+            # q contains NOPE part (v_head_dim)
+            q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+            q_rope_reshaped = q_rope.view(
+                -1, layer.tp_q_head_num, layer.head_dim - layer.v_head_dim
+            )
+            query = torch.cat([q_nope, q_rope_reshaped], dim=-1)
+        else:
+            # q already has both parts
+            query = q.view(-1, layer.tp_q_head_num, layer.head_dim)
+
+        # Ensure query has shape [bs, acc_q_len, num_q_heads, head_dim] when seq_len 1
+        if query.dim() == 3:
+            query = query.view(forward_batch.batch_size, -1, layer.tp_q_head_num, layer.head_dim)
 
         # Prepare KV cache inline
         k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)

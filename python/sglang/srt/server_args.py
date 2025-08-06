@@ -436,10 +436,10 @@ class ServerArgs:
                     f"TensorRT-LLM MLA only supports page_size of 32 or 64, changing page_size from {self.page_size} to 64."
                 )
                 self.page_size = 64
-            if self.speculative_algorithm is not None:
-                raise ValueError(
-                    "trtllm_mla backend does not support speculative decoding yet."
-                )
+            # if self.speculative_algorithm is not None:
+            #     raise ValueError(
+            #         "trtllm_mla backend does not support speculative decoding yet."
+            #     )
 
         if self.attention_backend == "trtllm_mha":
             if not is_sm100_supported():
@@ -1307,6 +1307,7 @@ class ServerArgs:
                 "fa3",
                 "flashmla",
                 "cutlass_mla",
+                "trtllm_mla",
             ],
             default=ServerArgs.decode_attention_backend,
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
